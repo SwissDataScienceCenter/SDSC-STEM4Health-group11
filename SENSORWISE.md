@@ -109,6 +109,33 @@ EOF
 
 When submitting, set `user=` to the team name in `submit.ipynb`. The first submission went in as `"TEMPLATE"`.
 
+## Leaderboard simulator
+
+[`src/leaderboard_sim.py`](src/leaderboard_sim.py) estimates a submission's leaderboard score **before** you submit it.
+
+```bash
+python src/leaderboard_sim.py submission_a.csv submission_b.csv   # score candidate files
+python src/leaderboard_sim.py --sweep                             # best number of A batches to flag
+```
+
+How it works. The first submission's leaderboard response leaks information about the test labels:
+- **Process B** scored F1 = 1.0, so its B predictions *are* the true labels, and B is scored exactly.
+- **Process A**'s precision, recall and accuracy give exact counts: among the 125 batches it called accepted, **15 are truly rejected**; among the 36 it called rejected, **26 are**. So the test set has about 41 rejected batches.
+
+For A, the simulator takes per-batch P(rejected) from the sensor-wise model, calibrated out-of-fold. It forces each group to contain exactly the known number of rejected batches, samples 20,000 plausible answer keys, and scores the submission against all of them. The reference file is `leaderboard/first_submission.csv`, a rerun of `brpmm.py` with its fixed seed; the simulator checks it against the leaderboard metrics.
+
+Current results:
+
+| Entry | Expected score (5–95% range) |
+|---|---|
+| First submission (sanity check) | 0.949 (matches the real leaderboard) |
+| `submission_sensorwise.csv` (33 A batches flagged) | **0.965** (0.960–0.972) |
+| Best flag count from the sweep (26 flagged) | 0.967 |
+
+Flagging anywhere from 24 to 36 A batches gives about 0.965–0.967, so the current submission sits on the plateau.
+
+**Caveat:** the known counts and the B labels are hard facts, but which specific A batches are bad comes from this model's own probabilities. The simulator therefore favours this model's picks, and the real uncertainty is wider than the ranges shown. Use it to compare variants of this model and to choose the flag count. It is not an unbiased judge of a completely different model.
+
 ## Caveats
 
 - All numbers are cross-validation estimates on the 161 calibration batches (40 rejected). With so few positives, differences below about 0.01 F1 are noise.

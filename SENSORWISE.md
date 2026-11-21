@@ -4,23 +4,19 @@ Branch: `ramona-sensorwise` · Code: [`src/sensorwise.py`](src/sensorwise.py)
 
 ## TL;DR
 
-A new model for **process A** that replaces the global-PCA approach in `src/brpmm.py` for that process. Process B is unchanged, since `brpmm.py` already scores perfectly there.
+A new model for **process A** that replaces the global-PCA approach in `src/brpmm.py` for that process. Process B is unchanged and still handled by `brpmm.py`.
 
-| Model (process A) | F1, accepted = positive (leaderboard metric) | Bad batches caught (CV) |
+| Model (process A) | F1, accepted = positive (grading metric) | Bad batches caught (CV) |
 |---|---|---|
-| Global PCA + classifier (`brpmm.py`) | 0.891 CV · **0.898 on leaderboard** | 27 / 40 |
+| Global PCA + classifier (`brpmm.py`) | 0.891 CV | 27 / 40 |
 | **Sensor-wise + safe ranges (this branch)** | **0.932 CV** | **37 / 40** |
 
-Expected leaderboard score ≈ (0.93 + 1.00) / 2 ≈ **0.966**, vs 0.949 for the first submission. This is a cross-validation estimate and isn't confirmed on the leaderboard yet.
+## Grading metric
 
-## How the leaderboard scores
+- **score = mean of the per-project F1 scores**
+- F1 treats **`accepted` as the positive class**
 
-From the first submission's response:
-- **score = mean of the F1 scores for process A and B**
-- F1 treats **`accepted` as the positive class**. Working back from the reported precision and recall, the A test set has about 120 accepted and 41 rejected batches.
-- B is already at 1.0, so **only process A can move the score**.
-
-Because F1 is on the majority class, it's better to flag only the clearly suspicious batches as rejected and call borderline ones accepted.
+Because F1 is on the majority class, it's better to flag only the clearly suspicious batches as rejected and call borderline ones accepted. That's why the decision threshold is tuned for F1(accepted), not for balanced accuracy.
 
 ## What we found in the data
 
@@ -106,35 +102,6 @@ t["label"] = [a[i] if p == "A" else b[i] for i, p in zip(t.batch_id, t.project)]
 t.to_csv("submission_sensorwise.csv", index=False)
 EOF
 ```
-
-When submitting, set `user=` to the team name in `submit.ipynb`. The first submission went in as `"TEMPLATE"`.
-
-## Leaderboard simulator
-
-[`src/leaderboard_sim.py`](src/leaderboard_sim.py) estimates a submission's leaderboard score **before** you submit it.
-
-```bash
-python src/leaderboard_sim.py submission_a.csv submission_b.csv   # score candidate files
-python src/leaderboard_sim.py --sweep                             # best number of A batches to flag
-```
-
-How it works. The first submission's leaderboard response leaks information about the test labels:
-- **Process B** scored F1 = 1.0, so its B predictions *are* the true labels, and B is scored exactly.
-- **Process A**'s precision, recall and accuracy give exact counts: among the 125 batches it called accepted, **15 are truly rejected**; among the 36 it called rejected, **26 are**. So the test set has about 41 rejected batches.
-
-For A, the simulator takes per-batch P(rejected) from the sensor-wise model, calibrated out-of-fold. It forces each group to contain exactly the known number of rejected batches, samples 20,000 plausible answer keys, and scores the submission against all of them. The reference file is `leaderboard/first_submission.csv`, a rerun of `brpmm.py` with its fixed seed; the simulator checks it against the leaderboard metrics.
-
-Current results:
-
-| Entry | Expected score (5–95% range) |
-|---|---|
-| First submission (sanity check) | 0.949 (matches the real leaderboard) |
-| `submission_sensorwise.csv` (33 A batches flagged) | **0.965** (0.960–0.972) |
-| Best flag count from the sweep (26 flagged) | 0.967 |
-
-Flagging anywhere from 24 to 36 A batches gives about 0.965–0.967, so the current submission sits on the plateau.
-
-**Caveat:** the known counts and the B labels are hard facts, but which specific A batches are bad comes from this model's own probabilities. The simulator therefore favours this model's picks, and the real uncertainty is wider than the ranges shown. Use it to compare variants of this model and to choose the flag count. It is not an unbiased judge of a completely different model.
 
 ## Caveats
 

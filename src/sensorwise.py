@@ -22,7 +22,7 @@ Pipeline:
      are still acceptable). An unsupervised worst-sensor monitor is kept
      for interpretation only.
 
-CV result (5 seeds x 5-fold x 2 repeats), leaderboard metric F1(accepted):
+CV result (5 seeds x 5-fold x 2 repeats), grading metric F1(accepted):
   global-PCA model (brpmm.py) 0.891 | ExtraTrees 0.911 | + Envelope 0.931
 Tried without gain: block/per-sensor PCA, shakiness, over/undersampling,
 mode-aware scaling, event/oscillation-amplitude/step features, smaller
@@ -297,7 +297,7 @@ def main():
     if a.predict:
         Ft = load_feats("test")
         m = SensorwiseModel().fit(F, y)
-        # Leaderboard metric = F1 with 'accepted' as the positive class.
+        # Grading metric = F1 with 'accepted' as the positive class.
         # Pick the fraction of batches to flag as rejected that maximises it
         # out-of-fold, then flag that same fraction of the test batches
         # (a fraction transfers more robustly than a raw score threshold).

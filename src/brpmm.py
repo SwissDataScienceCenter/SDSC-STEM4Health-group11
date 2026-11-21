@@ -82,11 +82,13 @@ def load_process(root: str, proc: str, cache_dir: str | None):
 
 
 def labels_to_y(lab: pd.DataFrame, ids: list[str]) -> np.ndarray:
-    s = lab.set_index("batch_id")["label"].reindex(ids)
-    y = (s.astype(str).str.lower().str.strip() == "rejected").astype(int).to_numpy()
-    if y.sum() == 0:
+    """1 = rejected, 0 = accepted, -1 = batch has NO label (missing from the labels file)."""
+    s = lab.drop_duplicates("batch_id").set_index("batch_id")["label"].reindex(ids)
+    txt = s.astype(str).str.lower().str.strip()
+    y = np.where(s.isna(), -1, (txt == "rejected").astype(int))
+    if (y == 1).sum() == 0:
         raise ValueError(f"No 'rejected' labels found; values: {lab['label'].unique()}")
-    return y
+    return y.astype(int)
 
 
 # ------------------------------------------------------------------ featurising
@@ -241,7 +243,17 @@ def run_process(proc, cal, lab, tst, self_train=True):
     ids, S, Tr = featurise(cal, cfg)
     y = labels_to_y(lab, ids)
     tids, St, Trt = featurise(tst, cfg)
-    print(f"[{proc}] cal={len(ids)} (rejected={y.sum()}), test={len(tids)}, "
+    unl = y < 0                       # calibration batches without a label
+    n_unl = int(unl.sum())
+    if n_unl:
+        print(f"[{proc}] WARNING: {n_unl} calibration batches have no label -> not used for supervised "
+              f"training, treated as unlabelled (used only for self-training)")
+    S_unl, Tr_unl = S[unl], Tr[unl]
+    S, Tr, y = S[~unl], Tr[~unl], y[~unl]
+    # unlabelled calibration batches are scored together with the test batches
+    St_all, Trt_all = np.vstack([St, S_unl]), np.vstack([Trt, Tr_unl])
+    n_t = len(tids)
+    print(f"[{proc}] labelled cal={len(y)} (rejected={y.sum()}), unlabelled cal={n_unl}, test={n_t}, "
           f"features: summary={S.shape[1]}, trajectory={Tr.shape[1]}")
 
     oof = oof_scores(S, Tr, y, cfg)
@@ -249,16 +261,17 @@ def run_process(proc, cal, lab, tst, self_train=True):
     report(proc, y, oof, thr)
 
     model = ProcessModel(cfg).fit(S, Tr, y)
-    s_test = model.score(St, Trt)
+    s_test = model.score(St_all, Trt_all)
 
     if self_train:
         # Self-supervised recalibration: adopt confidently-accepted test batches
         # as extra normal reference (unlabelled, no leakage of labels).
         conf = s_test < min(thr, np.quantile(oof[y == 0], 0.75))
         if conf.sum() > 0:
-            model = ProcessModel(cfg).fit(S, Tr, y, extra_normal_Tr=Trt[conf])
-            s_test = model.score(St, Trt)
-            print(f"[{proc}] self-training: +{int(conf.sum())} unlabelled test batches added to normal reference")
+            model = ProcessModel(cfg).fit(S, Tr, y, extra_normal_Tr=Trt_all[conf])
+            s_test = model.score(St_all, Trt_all)
+            print(f"[{proc}] self-training: +{int(conf.sum())} unlabelled batches added to normal reference")
+    s_test = s_test[:n_t]             # only test batches go into the submission
 
     pred = np.where(s_test >= thr, "rejected", "accepted")
     print(f"[{proc}] test predicted rejected: {(pred == 'rejected').sum()}/{len(pred)} "

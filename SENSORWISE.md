@@ -36,7 +36,8 @@ Plotting every raw batch, with accepted and rejected in different colours, showe
 
    This is the brief's "acceptable vs. unacceptable process variation", in concrete form.
 4. **There are two operating modes.** Batches are about 2,370 or about 2,725 rows long. The short mode runs about 1.5° hotter on temperature_2 and about 3.4 higher on pressure_3, and it has twice the rejection rate (37% vs 19%).
-5. About 20 rejected batches show **no measurable difference** from accepted ones on any statistic we tried. Their rejection likely comes from something the sensors don't capture, which caps achievable performance.
+5. **There's a hidden third recipe.** Among the long batches, a group of accepted batches has temperature_2 ≈ 91.5 (instead of ≈ 86), pressure_2 ≈ 8.6, pressure_3 ≈ 58 and pressure_4 ≈ 5, all shifted together. It's 9 batches in calibration and 18 in test. Treating it as its own mode tightens the safe ranges (temperature_2 ±8.2 → ±5.6, pressure_3 ±21.6 → ±16.7) and improves ranking (CV AUC 0.926 → 0.940). F1 gains only +0.003, which is noise, because the classifier had already learned the recipe.
+6. **About 10 rejected batches can't be told apart from accepted ones.** About 20 rejected batches have no out-of-range level shift; the classifier still catches about half of those through subtler signals. The remaining ~10 sit in the middle of the normal range on every sensor, every statistic (including 500 extra features) and every combination we tested ("several sensors slightly off", recipe-aware T²: AUC 0.57–0.70, about chance). Their rejection most likely comes from information the sensors don't record (lab assays, raw-material quality), which caps achievable F1 at about 0.93. In practice, borderline batches should go to a review zone for lab confirmation.
 
 ## The model
 

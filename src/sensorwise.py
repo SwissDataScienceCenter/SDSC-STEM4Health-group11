@@ -19,11 +19,14 @@ Pipeline:
   3. learned per-sensor safe ranges (Envelope): any set-point shift larger
      than ever seen in an accepted batch -> rejected
   4. ExtraTrees classifier on the deviations (learns which deviation sizes
-     are still acceptable). An unsupervised worst-sensor monitor is kept
+     are still acceptable), trained only on accepted vs the SUBTLE rejected
+     batches the safe ranges don't flag (SubtleModel). An unsupervised worst-sensor monitor is kept
      for interpretation only.
 
 CV result (5 seeds x 5-fold x 2 repeats), grading metric F1(accepted):
   global-PCA model (brpmm.py) 0.891 | ExtraTrees 0.911 | + Envelope 0.931
+  FINAL SubtleModel (trees trained only on the cases the Envelope misses):
+  AUC 0.927 -> 0.956, rejected caught 28 -> 35 / 40 (see SubtleModel)
 Tried without gain: block/per-sensor PCA, shakiness, over/undersampling,
 mode-aware scaling, event/oscillation-amplitude/step features, smaller
 feature sets, ET hyper-parameters (all within +-0.005).
@@ -241,6 +244,50 @@ class SensorwiseModel:
         return np.where(self.env.flag(F), 1.0 + p, p)
 
 
+class SubtleModel(SensorwiseModel):
+    """Final model: safe ranges for the obvious faults, trees for the subtle ones.
+
+    The Envelope already catches batches with a big out-of-range shift. If the
+    trees are also trained on those, they spend their effort on "big shift =
+    bad" and get sloppy at the fine boundary. So the trees learn only from
+    accepted vs SUBTLE rejected batches (those the Envelope does not flag),
+    on robust z-scores computed per operating mode.
+
+    Subtle rejected batches show e.g. a temperature_1 dip mid-batch and larger
+    pressure_4 swings; individually small, but consistent in combination.
+    CV (same pipeline as --predict, 5 fresh seeds): F1(accepted) 0.911 -> 0.938,
+    AUC 0.927 -> 0.956, rejected caught 28 -> 35 / 40 at 5 -> 6 / 121 false alarms.
+    """
+
+    def _z(self, F):
+        X = F.to_numpy(float)
+        short = (F["len"] < MODE_SPLIT).to_numpy()
+        Z = np.zeros(X.shape)
+        for m in (False, True):
+            med, sc = self.ref[m]
+            Z[short == m] = (X[short == m] - med) / sc
+        return np.nan_to_num(np.clip(Z, -50, 50))
+
+    def fit(self, F, y):
+        self.env = Envelope().fit(F, y)
+        X = F.to_numpy(float)
+        short = (F["len"] < MODE_SPLIT).to_numpy()
+        self.ref = {}
+        for m in (False, True):
+            G = X[(y == 0) & (short == m)]
+            med = np.nanmedian(G, 0)
+            self.ref[m] = (med, np.nanmedian(np.abs(G - med), 0) * 1.4826 + 1e-9)
+        subtle = (y == 0) | ~self.env.flag(F)
+        self.et = ExtraTreesClassifier(n_estimators=800, min_samples_leaf=2, max_features="sqrt",
+                                       class_weight="balanced", random_state=SEED,
+                                       n_jobs=-1).fit(self._z(F)[subtle], y[subtle])
+        return self
+
+    def score(self, F):
+        p = self.et.predict_proba(self._z(F))[:, 1]
+        return np.where(self.env.flag(F), 1.0 + p, p)
+
+
 # ----------------------------------------------------------------- evaluation
 def labels(F):
     lab = pd.read_csv(os.path.join(ROOT, "calibration data/calibration_labels.csv"))
@@ -283,8 +330,10 @@ def main():
 
     mon = cv_scores(F, y, lambda Ft, yt: (lambda m: lambda Fe: m.parts(Fe)[1])(SensorwiseModel().fit(Ft, yt)))
     sup = cv_scores(F, y, lambda Ft, yt: SensorwiseModel().fit(Ft, yt).score)
-    show("NEW monitor only (no bad labels used)", y, mon)
-    show("NEW sensor-wise model", y, sup)
+    sub = cv_scores(F, y, lambda Ft, yt: SubtleModel().fit(Ft, yt).score)
+    show("monitor only (no bad labels used)", y, mon)
+    show("sensor-wise model (previous)", y, sup)
+    show("FINAL: subtle-trained model", y, sub)
 
     if os.path.exists(os.path.join(CACHE, "feats_A.npz")):
         S, Tr, mk = baseline_oof(F.index)
@@ -296,13 +345,13 @@ def main():
 
     if a.predict:
         Ft = load_feats("test")
-        m = SensorwiseModel().fit(F, y)
+        m = SubtleModel().fit(F, y)
         # Grading metric = F1 with 'accepted' as the positive class.
         # Pick the fraction of batches to flag as rejected that maximises it
         # out-of-fold, then flag that same fraction of the test batches
         # (a fraction transfers more robustly than a raw score threshold).
         from sklearn.metrics import f1_score
-        oof = cv_scores(F, y, lambda Ftr, ytr: SensorwiseModel().fit(Ftr, ytr).score, n_repeats=10)
+        oof = cv_scores(F, y, lambda Ftr, ytr: SubtleModel().fit(Ftr, ytr).score, n_repeats=10)
         qs = np.linspace(0.05, 0.5, 46)
         f1s = [f1_score(1 - y, (oof < np.quantile(oof, 1 - q)).astype(int)) for q in qs]
         q = qs[int(np.argmax(f1s))]

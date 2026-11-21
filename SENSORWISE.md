@@ -6,10 +6,13 @@ Branch: `ramona-sensorwise` · Code: [`src/sensorwise.py`](src/sensorwise.py)
 
 A new model for **process A** that replaces the global-PCA approach in `src/brpmm.py` for that process. Process B is unchanged and still handled by `brpmm.py`.
 
-| Model (process A) | F1, accepted = positive (grading metric) | Bad batches caught (CV) |
-|---|---|---|
-| Global PCA + classifier (`brpmm.py`) | 0.891 CV | 27 / 40 |
-| **Sensor-wise + safe ranges (this branch)** | **0.932 CV** | **37 / 40** |
+| Model (process A) | F1, accepted = positive (grading metric) | AUC | Bad batches caught (CV) |
+|---|---|---|---|
+| Global PCA + classifier (`brpmm.py`) | 0.891 CV | – | 27 / 40 |
+| Sensor-wise + safe ranges (previous version) | 0.911 (fresh seeds) | 0.927 | 28 / 40 |
+| **Sensor-wise + safe ranges + subtle-trained trees (final, `SubtleModel`)** | **0.938 (fresh seeds)** | **0.956** | **35 / 40** |
+
+"Fresh seeds" = F1 at the chosen flag rate, re-measured on 5 new random CV splits (the threshold was not tuned on them), so it is the fairest estimate. Run-to-run noise is about ±0.005.
 
 ## Grading metric
 
@@ -37,14 +40,15 @@ Plotting every raw batch, with accepted and rejected in different colours, showe
    This is the brief's "acceptable vs. unacceptable process variation", in concrete form.
 4. **There are two operating modes.** Batches are about 2,370 or about 2,725 rows long. The short mode runs about 1.5° hotter on temperature_2 and about 3.4 higher on pressure_3, and it has twice the rejection rate (37% vs 19%).
 5. **There's a hidden third recipe.** Among the long batches, a group of accepted batches has temperature_2 ≈ 91.5 (instead of ≈ 86), pressure_2 ≈ 8.6, pressure_3 ≈ 58 and pressure_4 ≈ 5, all shifted together. It's 9 batches in calibration and 18 in test. Treating it as its own mode tightens the safe ranges (temperature_2 ±8.2 → ±5.6, pressure_3 ±21.6 → ±16.7) and improves ranking (CV AUC 0.926 → 0.940). F1 gains only +0.003, which is noise, because the classifier had already learned the recipe.
-6. **About 10 rejected batches can't be told apart from accepted ones.** About 20 rejected batches have no out-of-range level shift; the classifier still catches about half of those through subtler signals. The remaining ~10 sit in the middle of the normal range on every sensor, every statistic (including 500 extra features) and every combination we tested ("several sensors slightly off", recipe-aware T²: AUC 0.57–0.70, about chance). Their rejection most likely comes from information the sensors don't record (lab assays, raw-material quality), which caps achievable F1 at about 0.93. In practice, borderline batches should go to a review zone for lab confirmation.
+6. **The "hard" rejected batches leave a weak, combined trace.** About 20 rejected batches have no out-of-range level shift, and the previous model missed about 11 of them. One statistic at a time they look normal (nothing survives a multiple-testing correction, and we also checked batch order, missing values, decimals, start/end transients, time lags between sensors and mass-balance ratios). But a model trained only to separate those 11 from accepted batches reaches AUC 0.83, while shuffled labels peak at 0.70. So there is a signal, spread over several small effects: temperature_1 tends to start high and dip mid-batch with a wider spread, pressure_4 swings harder, and density is slightly low in the normal long recipe.
+7. **Training the trees only on the subtle cases recovers most of them.** When the obvious (out-of-range) rejected batches are left out of the classifier's training (the safe ranges already handle them), the trees focus on the fine boundary. Same features, same settings: F1 0.911 → 0.938 on fresh seeds, rejected caught 28 → 35 / 40, false alarms 5 → 6 / 121. About 5 rejected batches remain indistinguishable; those likely need information the sensors don't record (lab assays), so borderline batches should still go to a review zone.
 
 ## The model
 
 ```
 raw batch ─► per-sensor statistics ─► (a) learned safe ranges ──► flagged? → rejected
-                                      (b) ExtraTrees classifier ─► rank the rest
-                                                                      └► flag top ~20% overall
+                                      (b) ExtraTrees, trained on the  ─► rank the rest
+                                          subtle cases only               └► flag top ~25% overall
 ```
 
 1. **Per-sensor statistics** (`batch_stats`), computed on the middle 90% of each batch: level (median), fast noise, spread, slow drift ("wander"), oscillation, spike rate, tail heaviness, and start/end transients. That's 9 statistics × 11 sensors, plus batch length.
@@ -52,8 +56,8 @@ raw batch ─► per-sensor statistics ─► (a) learned safe ranges ──► 
 3. **Learned safe ranges** (`Envelope`): for each sensor, the shift is its level minus the accepted-batch median of the same operating mode. A batch is flagged if any sensor is shifted more than **1.5× the largest shift ever seen in an accepted batch** (and more than 8 robust standard deviations, so normal noise never triggers it).
    - On its own this catches about 16/40 bad batches with about 3/121 false alarms.
    - It's fully explainable, e.g. "temperature_4 shifted 3.0°, the safe limit is 1.5°".
-4. **ExtraTrees** on the z-scores, plus the worst deviation per statistic type, a length feature and a short-mode flag. It handles the subtler cases and learns acceptable shift sizes per sensor.
-5. **Final ranking**: batches outside a safe range come first, then the rest ordered by ExtraTrees probability. The fraction to flag as rejected is chosen to maximise out-of-fold F1(accepted) over 10× repeated 5-fold CV. It comes out at **about 20%**, which is 33 of the 161 test batches.
+4. **ExtraTrees** on robust z-scores computed per operating mode (`SubtleModel`). It is trained only on accepted batches vs the rejected batches the safe ranges do **not** flag, so it specialises in the subtle faults instead of relearning "big shift = bad". (The previous version, `SensorwiseModel`, trained on all batches with pooled z-scores plus worst-deviation features; it is kept in the code for comparison.)
+5. **Final ranking**: batches outside a safe range come first, then the rest ordered by ExtraTrees probability. The fraction to flag as rejected is chosen to maximise out-of-fold F1(accepted) over 10× repeated 5-fold CV. It comes out at **about 25%** (close to the 25% rejection rate in calibration), which is 41 of the 161 test batches. None of the 18 hot-recipe test batches are flagged.
 
 ### How it maps to the challenge requirements
 
@@ -76,6 +80,7 @@ Evaluated on the same CV splits across 5 seeds:
 - **Event, oscillation-amplitude and step-jump features**
 - **Smaller feature sets** and ExtraTrees hyperparameter changes
 - **Blending with the `brpmm.py` score.** This was worse than the new model alone.
+- **Hundreds of extra features** (tsfresh-style stats, time segments, multi-scale, cross-correlations, sensor-relation residuals) and other classifiers (RandomForest, gradient boosting, L1 logistic regression, SVM, kNN, ensembles). Adding the extra features to the final model also didn't help.
 - **A fixed "≥ 2.5 units" rule.** This dropped F1 to 0.76 because noisy sensors such as temperature_2 and pressure_2 naturally vary that much. The learned per-sensor ranges solve this.
 
 ## How to run
@@ -107,5 +112,6 @@ EOF
 ## Caveats
 
 - All numbers are cross-validation estimates on the 161 calibration batches (40 rejected). With so few positives, differences below about 0.01 F1 are noise.
-- The flag fraction (about 20%) is tuned on out-of-fold scores, so the CV F1 is slightly optimistic. The same bias applies to the baseline comparison.
+- The final model's idea came from studying the batches we were missing, and we tried about 30 variants on the same 161 batches. Its true gain is probably somewhat smaller than the CV numbers suggest (our guess: +0.01 to +0.02 F1), but it is consistently positive.
+- The flag fraction (about 25%) is tuned on out-of-fold scores, so the CV F1 is slightly optimistic. The same bias applies to the baseline comparison.
 - Safe ranges assume test shifts resemble calibration shifts. A larger but still acceptable shift on a sensor would be a false alarm, and that's exactly the "unseen variability" trade-off the brief mentions.

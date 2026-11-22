@@ -117,6 +117,9 @@ def main():
     ap.add_argument("--kinds", default="all")
     ap.add_argument("--seeds", type=int, default=5)
     ap.add_argument("--predict", default=None)
+    ap.add_argument("--rule", choices=["threshold", "fraction"], default="threshold",
+                    help="threshold = fixed score cut calibrated on out-of-fold scores (robust if the test rejection "
+                         "rate differs from calibration); fraction = flag the top q of the test set")
     a = ap.parse_args()
     F = SW.load_feats("cal"); y = SW.labels(F)
     if a.predict:
@@ -125,10 +128,14 @@ def main():
         qs = np.linspace(0.05, 0.5, 46)
         f1 = np.mean([[f1_at(y, o, q) for q in qs] for o in oofs], 0)
         q = qs[int(np.argmax(f1))]
-        print(f"[{a.predict}] flag top {q:.0%} as rejected (OOF F1 accepted = {f1.max():.3f})")
+        thr = float(np.mean([np.quantile(o, 1 - q) for o in oofs]))   # score cut at the OOF-optimal flag rate
+        print(f"[{a.predict}] OOF-optimal flag rate {q:.0%} (F1 accepted = {f1.max():.3f}) -> score threshold {thr:.3f}")
         Ft = SW.load_feats("test"); s = BayesSubtle(**kw).fit(F, y).score(Ft)
+        cut = thr if a.rule == "threshold" else np.quantile(s, 1 - q)
+        print(f"  rule={a.rule}: flags {(s >= cut).sum()}/{len(s)} ({(s >= cut).mean():.1%}); "
+              f"threshold rule would flag {(s >= thr).sum()}, fraction rule {(s >= np.quantile(s, 1 - q)).sum()}")
         out = pd.DataFrame({"batch_id": Ft.index, "project": "A", "score": s,
-                            "label": np.where(s >= np.quantile(s, 1 - q), "rejected", "accepted")})
+                            "label": np.where(s >= cut, "rejected", "accepted")})
         f = f"predictions_A_bayes_{a.predict}.csv"; out.to_csv(f, index=False)
         print(f"wrote {f}: {(out.label == 'rejected').sum()}/{len(out)} rejected")
         return

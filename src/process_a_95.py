@@ -127,11 +127,19 @@ def fit_model(calibration, labels):
                 config=config, sensor_columns=sensors, n_features=95)
 
 
-def predict(artifact, frame):
+def predict(artifact, frame, rate=None):
     ids, summaries, trajectories, batches = extract(frame, artifact["config"], artifact["sensor_columns"])
     scores = score(artifact["model"], artifact["forecaster"], summaries, trajectories, batches)
-    return pd.DataFrame(dict(batch_id=ids, score=scores,
-                             label=np.where(scores >= artifact["threshold"], "rejected", "accepted")))
+    if rate is None:
+        cut = artifact["threshold"]
+    else:  # flag the k highest-scoring batches, k = round(rate * n)
+        k = max(1, int(round(rate * len(scores))))
+        cut = np.sort(scores)[::-1][k - 1]
+    out = pd.DataFrame(dict(batch_id=ids, score=scores,
+                            label=np.where(scores >= cut, "rejected", "accepted")))
+    print(f"flagged {(out.label == 'rejected').sum()}/{len(out)} as rejected; "
+          f"{int((scores >= 1).sum())} batches outside sensor limits (score>=1)")
+    return out
 
 
 def main():
@@ -143,6 +151,8 @@ def main():
     inference = commands.add_parser("predict")
     inference.add_argument("--input", type=Path, required=True)
     inference.add_argument("--out", type=Path, required=True)
+    inference.add_argument("--rate", type=float, default=None,
+                           help="flag this fraction of batches as rejected (e.g. 0.255); default: saved cutoff")
     args = parser.parse_args()
     if args.command == "train":
         root = args.data / "process A" / "calibration data"
@@ -152,7 +162,7 @@ def main():
         joblib.dump(artifact, args.model, compress=3)
         print(f"Saved {args.model} with rejection cutoff {artifact['threshold']:.6f}")
     else:
-        predictions = predict(joblib.load(args.model), pd.read_csv(args.input))
+        predictions = predict(joblib.load(args.model), pd.read_csv(args.input), args.rate)
         predictions.to_csv(args.out, index=False)
 
 

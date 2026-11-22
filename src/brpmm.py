@@ -447,7 +447,14 @@ def main_real(args):
     outs = []
     for proc in ["A", "B"]:
         cal, lab, tst = load_process(args.data, proc, cache)
-        r = run_process(proc, cal, lab, tst, self_train=not args.no_self_train)
+        if proc == "A":
+            if __package__:
+                from . import process_a_95
+            else:
+                import process_a_95
+            r = process_a_95.predict(process_a_95.fit_model(cal, lab), tst)
+        else:
+            r = run_process(proc, cal, lab, tst, self_train=not args.no_self_train)
         r["project"] = proc
         outs.append(r)
     res = pd.concat(outs, ignore_index=True)

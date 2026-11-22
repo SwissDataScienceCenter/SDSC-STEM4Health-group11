@@ -490,3 +490,24 @@ def self_training_benefit(df_calib, df_labels, df_pool, n_acc=10, n_rej=2, n_rep
                      "n_pseudo_labelled": len(lab_u) - len(lab_s),
                      "pseudo_rejected": int((lab_u.label == "rejected").sum() - (lab_s.label == "rejected").sum())})
     return pd.DataFrame(rows)
+
+
+def predict_lr_submission(root=None):
+    """Generate the submitted Process B labels using six-feature logistic regression."""
+    cal, lab, test = load_process_b(root)
+    classifier, columns = fit_classifier(cal, lab)
+    scores = classifier_proba(classifier, columns, test)
+    return pd.DataFrame({"batch_id": scores.index, "project": "B",
+                         "label": np.where(scores > .5, "rejected", "accepted")})
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description=predict_lr_submission.__doc__)
+    parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
+    parser.add_argument("--out", type=Path, required=True)
+    args = parser.parse_args()
+    predictions = predict_lr_submission(args.data)
+    predictions.to_csv(args.out, index=False)
+    print(f"Wrote {len(predictions)} Process B labels to {args.out}")

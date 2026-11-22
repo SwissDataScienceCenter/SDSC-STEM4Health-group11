@@ -1,13 +1,18 @@
 """Project 2 - BRPMM: resilient batch process monitoring (first solution).
 
-Strategy (same for process A and B, process-specific features/params):
+Strategy (shared feature extraction, process-specific models):
 
 1. Per-batch featurisation (robust to sensor outliers)
    - summary features per sensor (median, MAD, quantiles, slope, start/end level,
      roughness) + batch length (A only);
    - time-normalised trajectory per sensor (K bins, bin medians) so batches of
      different length / phase are comparable.
-2. Two complementary detectors
+2. Process A uses class-weighted Extra Trees on selected batch summaries,
+   mode-specific sensor deviation, relative peak timing, and maximum rolling
+   MAD, plus targeted temperature, pressure, and density features. Batches
+   outside learned sensor limits rank first. The cutoff maximizes accepted-class F1 on
+   out-of-fold predictions.
+3. Process B uses two complementary detectors
    - MONITOR (unsupervised, "what is normal"): batch-wise PCA fitted on
      ACCEPTED batches only -> Hotelling T^2 + SPE (Q), normalised by empirical
      control limits.  Needs no rejected examples, so it copes with the heavy
@@ -15,10 +20,10 @@ Strategy (same for process A and B, process-specific features/params):
      correlation structure, not every new-but-acceptable level shift.
    - CLASSIFIER (supervised, "what is bad"): class-weighted logistic regression
      + extra-trees on the summary features -> discrimination near the border
-     (A_101..A_104 are rejected but only just outside the acceptable range).
+     between accepted and rejected batches.
    The final score blends both; the decision threshold is chosen on
    out-of-fold (repeated stratified CV) scores.
-3. Recalibration / self-supervised step (optional, --self-train): confidently
+4. Process B recalibration (enabled unless --no-self-train is set): confidently
    accepted TEST batches are added to the reference set and the monitor is
    refit, so the acceptable region adapts to new, benign variability.
 
@@ -50,7 +55,8 @@ B_DROP = ["hot_cold_switch", "feed_substate_concentration", "cooling_water_tempe
           "heating_water_temperature", "reactor_temperature"]
 
 CFG = {
-    "A": dict(n_bins=30, pca_var=0.90, use_length=True, drop=[], w_monitor=0.5),
+    "A": dict(n_bins=30, pca_var=0.90, use_length=True, drop=[], w_monitor=0.5,
+              use_rolling_mad=True, use_mad_persistence=False, use_targeted_features=True),
     "B": dict(n_bins=40, pca_var=0.90, use_length=False, drop=B_DROP, w_monitor=0.5),
 }
 
@@ -95,8 +101,22 @@ def _bin_medians(x: np.ndarray, k: int) -> np.ndarray:
     return np.array([np.median(x[a:max(b, a + 1)]) for a, b in zip(edges[:-1], edges[1:])])
 
 
-def batch_features(X: np.ndarray, n_bins: int, use_length: bool):
-    """X: (T, S) one batch.  Returns (summary vector, trajectory vector)."""
+def _rolling_mad(X: np.ndarray) -> np.ndarray:
+    """Window MAD per sensor using overlapping 1/30-batch windows."""
+    length = len(X)
+    width = min(length, max(5, round(length / 30)))
+    stride = max(1, width // 4)
+    starts = np.r_[np.arange(0, length - width, stride), length - width]
+    windows = np.lib.stride_tricks.sliding_window_view(X, width, axis=0)[starts]
+    centers = np.median(windows, axis=-1, keepdims=True)
+    return np.median(np.abs(windows - centers), axis=-1)
+
+
+def batch_features(
+    X: np.ndarray, n_bins: int, use_length: bool, *,
+    use_rolling_mad=False, retain_mad_windows=False, targeted_sensors=None,
+):
+    """Return batch summaries and sequence features for one batch."""
     T, S = X.shape
     t = np.linspace(-1, 1, T)
     summ, traj = [], []
@@ -113,16 +133,44 @@ def batch_features(X: np.ndarray, n_bins: int, use_length: bool):
         traj.append(_bin_medians(x, n_bins))
     if use_length:
         summ.append(np.log(T))
+    if use_rolling_mad:
+        rolling_mad = _rolling_mad(X)
+        traj.append(rolling_mad.max(axis=0))
+    if targeted_sensors is not None:
+        temperature, pressure, density = targeted_sensors
+        temperature_bins = traj[temperature]
+        dip = temperature_bins[7:23].min() - np.median(temperature_bins[:5])
+
+        start, stop = int(T * 0.05), int(T * 0.95)
+        steady_pressure = X[start:stop, pressure] if stop - start > 50 else X[:, pressure]
+        window = max(11, len(steady_pressure) // 20)
+        smooth = pd.Series(steady_pressure).rolling(window, center=True, min_periods=1).median()
+        wander = np.subtract(*np.percentile(smooth, [97.5, 2.5]))
+        traj.append(np.array([dip, wander, np.median(X[:, density])]))
+    if retain_mad_windows:
+        traj.append(rolling_mad.ravel())
     return np.array(summ, float), np.concatenate(traj)
 
 
 def featurise(df: pd.DataFrame, cfg: dict):
     drop = [c for c in cfg["drop"] if c in df.columns]
     cols = [c for c in df.columns if c != "batch_id" and c not in drop]
+    retain_mad_windows = cfg.get("use_mad_persistence", False)
+    targeted_sensors = None
+    if cfg.get("use_targeted_features", False):
+        targeted_sensors = tuple(cols.index(name) for name in ("temperature_1", "pressure_4", "density"))
     ids, S, Tr = [], [], []
     for bid, g in df.groupby("batch_id", sort=False):
-        s, tr = batch_features(g[cols].to_numpy(float), cfg["n_bins"], cfg["use_length"])
+        s, tr = batch_features(
+            g[cols].to_numpy(float), cfg["n_bins"], cfg["use_length"],
+            use_rolling_mad=cfg.get("use_rolling_mad", False),
+            retain_mad_windows=retain_mad_windows, targeted_sensors=targeted_sensors,
+        )
         ids.append(bid), S.append(s), Tr.append(tr)
+    if retain_mad_windows:
+        # Window counts vary with batch length. Padding is ignored by the model.
+        width = max(map(len, Tr))
+        Tr = [np.pad(tr, (0, width - len(tr)), constant_values=np.nan) for tr in Tr]
     return ids, np.vstack(S), np.vstack(Tr)
 
 
@@ -209,7 +257,132 @@ class ProcessModel:
         return (1 - w) * p_sup + w * _ratio_to_p(m)
 
 
+class ProcessAModel:
+    """Class-weighted Extra Trees with a sensor-limit ranking rule."""
+
+    # Midpoint between the two typical operating lengths, rounded to a row.
+    MODE_LENGTH = 2548
+    ENVELOPE_MODE_LENGTH = 2550
+    # Each sensor contributes 14 statistics. Its median is the third.
+    SENSOR_MEDIANS = slice(2, -1, 14)
+    # Keep the 5th, 50th and 95th percentiles, MAD, slope and roughness.
+    SUMMARY_STATS = (0, 2, 4, 5, 10, 13)
+
+    def _long_mode(self, summaries):
+        return summaries[:, -1] >= np.log(self.MODE_LENGTH)
+
+    def _with_deviation_score(self, summaries):
+        long_mode = self._long_mode(summaries)
+        scores = np.empty(len(summaries))
+        for mode, (center, lower, upper) in enumerate(self.references):
+            mask = long_mode == mode
+            delta = summaries[mask, self.SENSOR_MEDIANS] - center
+            scores[mask] = np.maximum(delta / upper, -delta / lower).max(axis=1)
+        sensor_stats = summaries[:, :-1].reshape(len(summaries), -1, 14)
+        selected = sensor_stats[:, :, self.SUMMARY_STATS].reshape(len(summaries), -1)
+        return np.column_stack((selected, summaries[:, -1], scores))
+
+    def _classifier_inputs(self, summaries, trajectories):
+        n_sensors = summaries[:, self.SENSOR_MEDIANS].shape[1]
+        split = n_sensors * self.n_bins
+        windows = trajectories[:, :split].reshape(len(summaries), n_sensors, self.n_bins)
+        peak_timing = windows.argmax(axis=2) / (self.n_bins - 1)
+        end_maxima = split + n_sensors
+        rolling_maxima = trajectories[:, split:end_maxima]
+        inputs = [self._with_deviation_score(summaries), peak_timing, rolling_maxima]
+        mode = self._envelope_long_mode(summaries).astype(int)
+        if self.use_targeted_features:
+            targeted = trajectories[:, end_maxima:end_maxima + 3].copy()
+            targeted[:, 2] -= self.density_centers[mode]
+            inputs.append(targeted)
+            end_maxima += 3
+        if self.use_mad_persistence:
+            rolling = trajectories[:, end_maxima:].reshape(len(summaries), -1, n_sensors)
+            above = rolling > self.mad_limits[mode, None, :]
+            window_count = np.isfinite(rolling).sum(axis=1)
+            inputs.append(above.sum(axis=1) / window_count)
+        return np.column_stack(inputs)
+
+    def _envelope_long_mode(self, summaries):
+        return summaries[:, -1] >= np.log(self.ENVELOPE_MODE_LENGTH)
+
+    def _envelope_shifts(self, summaries):
+        long_mode = self._envelope_long_mode(summaries)
+        centers = self.envelope_centers[long_mode.astype(int)]
+        return np.abs(summaries[:, self.SENSOR_MEDIANS] - centers)
+
+    def __init__(self, cfg):
+        self.n_bins = cfg["n_bins"]
+        self.use_mad_persistence = cfg.get("use_mad_persistence", False)
+        self.use_targeted_features = cfg.get("use_targeted_features", False)
+        self.classifier = ExtraTreesClassifier(
+            n_estimators=160, min_samples_leaf=1, class_weight="balanced",
+            random_state=SEED, n_jobs=2,
+        )
+
+    def fit(self, S, Tr, y):
+        accepted = S[y == 0]
+        long_mode = self._long_mode(accepted)
+        levels = accepted[:, self.SENSOR_MEDIANS]
+        self.references = []
+        for mode in (False, True):
+            reference = levels[long_mode == mode]
+            if not len(reference):
+                reference = levels
+            center = np.median(reference, axis=0)
+            residual = reference - center
+            floor = np.maximum(1.4826 * np.median(np.abs(residual), axis=0), 1e-6)
+            lower = np.maximum(-np.quantile(residual, 0.02, axis=0), floor)
+            upper = np.maximum(np.quantile(residual, 0.98, axis=0), floor)
+            self.references.append((center, lower, upper))
+        # The sensor envelope uses the validated 2,550-row split and a
+        # symmetric limit shared by both modes for each sensor.
+        envelope_long = self._envelope_long_mode(accepted)
+        n_sensors = levels.shape[1]
+        maxima_start = n_sensors * self.n_bins
+        if self.use_targeted_features:
+            density = Tr[y == 0, maxima_start + n_sensors + 2]
+            self.density_centers = np.array([
+                np.median(density[envelope_long == mode]) if (envelope_long == mode).any() else np.median(density)
+                for mode in (False, True)
+            ])
+        if self.use_mad_persistence:
+            normal_maxima = Tr[y == 0, maxima_start:maxima_start + n_sensors]
+            limits = []
+            for mode in (False, True):
+                reference = normal_maxima[envelope_long == mode]
+                limits.append(np.quantile(reference if len(reference) else normal_maxima, 0.98, axis=0))
+            self.mad_limits = np.stack(limits)
+        centers = []
+        for mode in (False, True):
+            reference = levels[envelope_long == mode]
+            centers.append(np.median(reference if len(reference) else levels, axis=0))
+        self.envelope_centers = np.stack(centers)
+        shifts = self._envelope_shifts(accepted)
+        self.envelope_limits = np.maximum(
+            1.5 * shifts.max(axis=0), 8 * 1.4826 * np.median(shifts, axis=0) + 1e-12,
+        )
+        self.classifier.fit(self._classifier_inputs(S, Tr), y)
+        return self
+
+    def score(self, S, Tr):
+        probability = self.classifier.predict_proba(self._classifier_inputs(S, Tr))[:, 1]
+        outside_limits = (self._envelope_shifts(S) > self.envelope_limits).any(axis=1)
+        return probability + outside_limits
+
+
 # ------------------------------------------------------------------ evaluation
+def process_a_threshold(y, scores):
+    """Choose the rejection cutoff that maximizes accepted-class F1."""
+    cuts = np.unique(np.r_[scores, np.nextafter(scores.max(), np.inf)])
+    predicted_accepted = scores[:, None] < cuts
+    accepted = y == 0
+    true_accepted = predicted_accepted[accepted].sum(axis=0)
+    f1 = 2 * true_accepted / (predicted_accepted.sum(axis=0) + accepted.sum())
+    best = np.flatnonzero(f1 == f1.max())
+    return float(cuts[best[len(best) // 2]])
+
+
 def best_threshold(y, s):
     cand = np.unique(np.quantile(s, np.linspace(0.02, 0.98, 97)))
     bal = np.array([balanced_accuracy_score(y, s >= c) for c in cand])
@@ -217,13 +390,13 @@ def best_threshold(y, s):
     return float(np.median(ok))  # middle of the best plateau = more stable
 
 
-def oof_scores(S, Tr, y, cfg, n_splits=5, n_repeats=3):
+def oof_scores(S, Tr, y, cfg, n_splits=5, n_repeats=3, model_class=ProcessModel):
     n = len(y)
     acc, cnt = np.zeros(n), np.zeros(n)
     n_splits = max(2, min(n_splits, int(y.sum())))
     rs = RepeatedStratifiedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=SEED)
     for tr, te in rs.split(S, y):
-        m = ProcessModel(cfg).fit(S[tr], Tr[tr], y[tr])
+        m = model_class(cfg).fit(S[tr], Tr[tr], y[tr])
         acc[te] += m.score(S[te], Tr[te])
         cnt[te] += 1
     return acc / cnt
@@ -232,7 +405,8 @@ def oof_scores(S, Tr, y, cfg, n_splits=5, n_repeats=3):
 def report(name, y, s, thr):
     pred = (s >= thr).astype(int)
     print(f"[{name}] OOF  AUC={roc_auc_score(y, s):.3f}  balAcc={balanced_accuracy_score(y, pred):.3f}  "
-          f"MCC={matthews_corrcoef(y, pred):.3f}  F1(rej)={f1_score(y, pred):.3f}  thr={thr:.3f}")
+          f"MCC={matthews_corrcoef(y, pred):.3f}  F1(acc)={f1_score(y, pred, pos_label=0):.3f}  "
+          f"F1(rej)={f1_score(y, pred):.3f}  thr={thr:.3f}")
 
 
 # ----------------------------------------------------------------------- driver
@@ -242,16 +416,18 @@ def run_process(proc, cal, lab, tst, self_train=True):
     y = labels_to_y(lab, ids)
     tids, St, Trt = featurise(tst, cfg)
     print(f"[{proc}] cal={len(ids)} (rejected={y.sum()}), test={len(tids)}, "
-          f"features: summary={S.shape[1]}, trajectory={Tr.shape[1]}")
+          f"features: summary={S.shape[1]}, sequence={Tr.shape[1]}")
 
-    oof = oof_scores(S, Tr, y, cfg)
-    thr = best_threshold(y, oof)
+    model_class = ProcessAModel if proc == "A" else ProcessModel
+    choose_threshold = process_a_threshold if proc == "A" else best_threshold
+    oof = oof_scores(S, Tr, y, cfg, model_class=model_class)
+    thr = choose_threshold(y, oof)
     report(proc, y, oof, thr)
 
-    model = ProcessModel(cfg).fit(S, Tr, y)
+    model = model_class(cfg).fit(S, Tr, y)
     s_test = model.score(St, Trt)
 
-    if self_train:
+    if self_train and proc == "B":
         # Self-supervised recalibration: adopt confidently-accepted test batches
         # as extra normal reference (unlabelled, no leakage of labels).
         conf = s_test < min(thr, np.quantile(oof[y == 0], 0.75))
@@ -302,7 +478,10 @@ def _synth(proc, n, rej_frac, rng, offset=0):
             if proc == "A" and rng.random() < 0.3:
                 X = X[: T // 8]                              # aborted run
         X[rng.integers(0, len(X), 3)] += 50                  # spikes
-        d = pd.DataFrame(X, columns=[f"s{j}" for j in range(6)])
+        columns = ["s0", "density", "temperature_1", "s3", "s4", "pressure_4"] if proc == "A" else [
+            f"s{j}" for j in range(6)
+        ]
+        d = pd.DataFrame(X, columns=columns)
         d.insert(0, "batch_id", f"{proc}_{offset + i:03d}")
         d["__bad"] = int(bad)
         rows.append(d)

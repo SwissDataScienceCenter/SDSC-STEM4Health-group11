@@ -36,12 +36,12 @@ On the fresh splits, the 95-feature model had 88.20% accuracy, 77.63% rejected p
 Run these commands from the repository root. Install NumPy, pandas, scikit-learn, joblib, and CPU PyTorch in the training environment.
 
 ```sh
-python -m process_a.model --model /tmp/process_a_95.joblib train --data "/path/to/Project 2 - BRPMM"
-python -m process_a.model --model /tmp/process_a_95.joblib predict --input "/path/to/Project 2 - BRPMM/process A/test data/test_data.csv" --out /tmp/process_a_predictions.csv
+python -m src.process_a.model --model /tmp/process_a_95.joblib train --data "/path/to/Project 2 - BRPMM"
+python -m src.process_a.model --model /tmp/process_a_95.joblib predict --input "/path/to/Project 2 - BRPMM/process A/test data/test_data.csv" --out /tmp/process_a_predictions.csv
 ```
 
 The data root contains `process A/calibration data/calibration_data.csv` and `process A/calibration data/calibration_labels.csv`. Test input is a long-format CSV with `batch_id` and the same 11 sensor columns. Keep readings in acquisition order within each batch. Each batch needs at least 24 readings for the GRU. The prediction CSV contains `batch_id`, `score`, and `label`.
 
-Training writes the classifier, GRU, sensor order, and cutoff to the chosen local path. The repository includes the source and documentation. Use the same Python environment to train and reload the local artifact.
+Training writes the classifier, GRU, sensor order, and cutoff to the chosen local path. The repository includes the source and documentation. Use the same Python environment to train and reload the local artifact. If you trained an artifact before the move into `src/`, rerun the training command to save it with the new module path.
 
 [Model source](model.py)

@@ -324,5 +324,5 @@ def main():
 
 if __name__ == "__main__":
     # Keep the model class importable by its package name when reloading joblib.
-    from process_a.model import main as package_main
+    from src.process_a.model import main as package_main
     package_main()

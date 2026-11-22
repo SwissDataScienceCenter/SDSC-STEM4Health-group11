@@ -40,7 +40,8 @@ from sklearn.model_selection import RepeatedStratifiedKFold
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import brpmm as B  # noqa: E402
-import process_a, process_b  # noqa: E402
+import process_a_configs as process_a  # noqa: E402
+import process_b  # noqa: E402
 from pipeline import Data, Pipeline, Store  # noqa: E402
 
 PROTOCOL = {"A": dict(n_splits=5, n_repeats=5, seed=42), "B": dict(n_splits=5, n_repeats=10, seed=42)}

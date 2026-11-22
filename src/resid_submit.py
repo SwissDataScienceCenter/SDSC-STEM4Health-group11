@@ -94,6 +94,9 @@ def main():
     ap.add_argument("--seeds", type=int, default=5)
     ap.add_argument("--b-from", default=None, help="CSV with B_* rows to copy into the submission")
     ap.add_argument("--out", default="submission.csv")
+    ap.add_argument("--no-resid", action="store_true", help="plain SubtleModel (no residual features)")
+    ap.add_argument("--drop", default="", help="comma-separated CALIBRATION batch_ids to leave out of training "
+                    "(e.g. labelled-rejected batches that look normal in every statistic: A_289,A_008,A_097,A_163,A_244)")
     ap.add_argument("--root", default=None, help="override data root (process A folder)")
     ap.add_argument("--cache", default=None)
     a = ap.parse_args()
@@ -102,10 +105,17 @@ def main():
     F0, Ft0 = SW.load_feats("cal"), SW.load_feats("test")
     y = SW.labels(F0)
     F, Ft = build(F0, Ft0)
+    if a.no_resid:
+        F, Ft = F0, Ft0
+    drop = [b for b in a.drop.split(",") if b]
+    if drop:
+        keep = ~F.index.isin(drop)
+        print(f"leaving {int((~keep).sum())} batches out of training: {drop}")
+        F, F0, y = F[keep], F0[keep], y[keep]
     print(f"A: {len(y)} labelled batches ({int(y.sum())} rejected), {len(Ft)} test batches, "
-          f"{F.shape[1] - F0.shape[1]} residual features added")
+          f"{F.shape[1] - F0.shape[1]} extra features")
     oofs = {}
-    for nm, X in (("base", F0), ("+resid", F)):
+    for nm, X in (("base", F0), ("final", F)):
         oofs[nm] = [oof_seed(X, y, s) for s in range(a.seeds)]
         m = pd.DataFrame([ST.metrics(y, o) for o in oofs[nm]])
         print(f"  CV {nm:7s} AUC={m.AUC.mean():.3f} F1@25%={m.F1_q25.mean():.3f}±{m.F1_q25.std():.3f} "
@@ -115,9 +125,9 @@ def main():
         cut = np.sort(s)[::-1][max(1, int(round(a.rate * len(s)))) - 1]
     else:
         qs = np.linspace(0.05, 0.5, 46)
-        f1 = np.mean([[ST.f1_at(y, o, q) for q in qs] for o in oofs["+resid"]], 0)
+        f1 = np.mean([[ST.f1_at(y, o, q) for q in qs] for o in oofs["final"]], 0)
         q = qs[int(np.argmax(f1))]
-        cut = float(np.mean([np.quantile(o, 1 - q) for o in oofs["+resid"]]))
+        cut = float(np.mean([np.quantile(o, 1 - q) for o in oofs["final"]]))
     lab = np.where(s >= cut, "rejected", "accepted")
     A = pd.DataFrame({"batch_id": Ft.index, "project": "A", "label": lab})
     print(f"test: flagged {(lab == 'rejected').sum()}/{len(lab)} as rejected ({(lab == 'rejected').mean():.1%})")
